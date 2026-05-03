@@ -1,1 +1,2 @@
 这个人很神秘
+点击访问魔法变声器网址： https://lewisruihan.github.io/magic-voice-changer/
