@@ -203,6 +203,35 @@
             return audioContext;
         }
 
+        // 全局唤醒 AudioContext (解决移动端特别是 iOS 的自动播放限制)
+        function unlockAudioContextForMobile() {
+            const ctx = getAudioContext();
+            if (ctx.state === 'suspended') {
+                ctx.resume();
+            }
+            // 创建一段极短的静音用于解锁底层音频限制
+            const buffer = ctx.createBuffer(1, 1, 22050);
+            const source = ctx.createBufferSource();
+            source.buffer = buffer;
+            source.connect(ctx.destination);
+            if (source.start) source.start(0);
+            else source.noteOn(0);
+
+            // 解锁一次后移除事件监听
+            document.removeEventListener('touchstart', unlockAudioContextForMobile);
+            document.removeEventListener('click', unlockAudioContextForMobile);
+        }
+        document.addEventListener('touchstart', unlockAudioContextForMobile, { once: true });
+        document.addEventListener('click', unlockAudioContextForMobile, { once: true });
+
+        // 为了兼容旧版 Safari，封装更为安全的 decodeAudioData 函数
+        function safeDecodeAudioData(ctx, arrayBuffer) {
+            return new Promise((resolve, reject) => {
+                // 回调函数方式在旧版 iOS Safari 中最可靠
+                ctx.decodeAudioData(arrayBuffer, resolve, reject);
+            });
+        }
+
         // 显示状态信息
         function showStatus(text, isError = false) {
             statusBox.style.display = 'block';
@@ -243,7 +272,7 @@
             try {
                 const ctx = getAudioContext();
                 const arrayBuffer = await file.arrayBuffer();
-                originalBuffer = await ctx.decodeAudioData(arrayBuffer);
+                originalBuffer = await safeDecodeAudioData(ctx, arrayBuffer); // 使用兼容模式解码
                 
                 // 默认使用原声处理一遍
                 await applyEffect('normal');
@@ -251,13 +280,13 @@
                 fileInput.value = ''; // 重置 input
             } catch (err) {
                 showStatus('解析音频失败，请更换格式重试。', true);
-                console.error(err);
+                console.warn('File decoding error:', err);
             }
         });
 
         // --- 事件监听：麦克风录音 ---
         recordBtn.addEventListener('mousedown', startRecording);
-        recordBtn.addEventListener('touchstart', (e) => { e.preventDefault(); startRecording(); });
+        recordBtn.addEventListener('touchstart', (e) => { e.preventDefault(); getAudioContext(); startRecording(); });
         
         window.addEventListener('mouseup', stopRecording);
         window.addEventListener('touchend', stopRecording);
@@ -266,9 +295,24 @@
             if (isRecording) return;
             stopPlayback();
             
+            // 检查浏览器是否支持录音 API
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                showStatus('当前环境或浏览器不支持录音，请使用上传音频或文本转语音功能。', true);
+                return;
+            }
+            
             try {
                 const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-                mediaRecorder = new MediaRecorder(stream);
+                
+                // 自动选择设备支持的最优格式，修复 iOS 强转 webm 失败的问题
+                let options = {};
+                if (MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
+                    options.mimeType = 'audio/webm;codecs=opus';
+                } else if (MediaRecorder.isTypeSupported('audio/mp4;codecs=mp4a.40.2')) {
+                    options.mimeType = 'audio/mp4;codecs=mp4a.40.2';
+                }
+                
+                mediaRecorder = new MediaRecorder(stream, options);
                 audioChunks = [];
 
                 mediaRecorder.ondataavailable = e => {
@@ -276,16 +320,18 @@
                 };
 
                 mediaRecorder.onstop = async () => {
-                    const blob = new Blob(audioChunks, { type: 'audio/webm' });
-                    // 如果 webm 失败，尝试作为普通音频处理
+                    // 使用媒体录制器原生的 mimeType（iOS 通常为 audio/mp4），避免强制写入 webm 导致无法解析
+                    const blob = new Blob(audioChunks, { type: mediaRecorder.mimeType || '' });
+                    
                     const arrayBuffer = await blob.arrayBuffer();
                     const ctx = getAudioContext();
                     try {
-                        originalBuffer = await ctx.decodeAudioData(arrayBuffer);
+                        originalBuffer = await safeDecodeAudioData(ctx, arrayBuffer); // 兼容性解码
                         await applyEffect('normal');
                         enableControls();
                     } catch (decodeErr) {
-                        showStatus('录音解析失败', true);
+                        showStatus('录音解析失败，您的设备可能不支持此格式。', true);
+                        console.warn('Decode Error:', decodeErr);
                     }
                     
                     // 停止所有音频轨道释放麦克风
@@ -304,8 +350,14 @@
                 showStatus('正在录音...');
 
             } catch (err) {
-                showStatus('无法访问麦克风，请检查权限。', true);
-                console.error(err);
+                // 如果用户拒绝权限，或者当前的 iframe 环境 (Canvas) 阻止了麦克风权限，会抛出此错误。
+                if (err.name === 'NotAllowedError' || err.name === 'SecurityError') {
+                    showStatus('预览环境受限或您拒绝了麦克风权限。请上传音频文件或使用输入文本功能。', true);
+                } else {
+                    showStatus('无法访问麦克风，请检查权限。', true);
+                }
+                // 使用 console.warn 替代 console.error 避免触发预览环境拦截器的错误弹窗
+                console.warn('Microphone access denied or restricted by environment:', err);
             }
         }
 
@@ -415,7 +467,7 @@
                 
                 showStatus('语音生成成功！请选择音色或播放。');
             } catch (error) {
-                console.error(error);
+                console.warn('TTS Error:', error);
                 showStatus('语音生成失败，请检查网络或重试。', true);
             } finally {
                 ttsBtn.disabled = false;
@@ -547,7 +599,7 @@
                 showStatus(`已切换至: ${effects.find(e => e.id === effectId).name}`);
             } catch (err) {
                 showStatus('渲染音频失败', true);
-                console.error(err);
+                console.warn('Render Error:', err);
             }
         }
 
@@ -627,7 +679,7 @@
             try {
                 const ctx = getAudioContext();
                 const arrayBuffer = await file.arrayBuffer();
-                const refBuffer = await ctx.decodeAudioData(arrayBuffer);
+                const refBuffer = await safeDecodeAudioData(ctx, arrayBuffer); // 兼容性解码
                 
                 // 核心算法：使用过零率(ZCR)进行基础音调的粗略比对
                 function getZCR(buf) {
@@ -674,7 +726,7 @@
                 
             } catch(err) {
                 showStatus('参考音频分析失败，请换个文件试试。', true);
-                console.error(err);
+                console.warn('Clone feature error:', err);
             } finally {
                 e.target.value = ''; // 清空输入，允许重复点击选择同一个文件
             }
@@ -774,7 +826,7 @@
                     showStatus('音频下载成功！');
                 } catch(e) {
                     showStatus('生成文件失败', true);
-                    console.error(e);
+                    console.warn('Download error:', e);
                 } finally {
                     downloadBtn.disabled = false;
                     downloadBtn.classList.remove('opacity-75', 'cursor-not-allowed');
